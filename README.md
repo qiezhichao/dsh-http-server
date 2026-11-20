@@ -216,3 +216,7 @@ node scripts/smoke-standalone.mjs    # 双开验证（需先配 standalonePort: 
 | 409 | `{"error":"session busy"}` | 同会话已有在跑任务（不排队，稍后重试） |
 | 404 | `{"error":"not found"}` | 会话不存在且不可恢复 |
 | 400 | `{"error":"invalid cwd"}` / `{"error":"invalid prompt"}` | cwd 逃逸沙箱 / body 缺 prompt |
+| 400 | `{"error":"invalid body"}` / `{"error":"invalid answer"}` / `{"error":"invalid answer batch"}` | answer body 非法 JSON / 结构不合法 / 批不匹配（每题恰一项） |
+| 404 | `{"error":"question not found"}` | 无该 callId 的可回答问题（已答/超时/不存在） |
+| 409 | `{"error":"reply queued"}` | 该问题已有排队回复，勿重复提交 |
+| 501 | `userQuestions service unavailable` | 宿主未提供 userQuestions 服务（非 web profile 组合） |
