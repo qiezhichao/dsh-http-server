@@ -47,6 +47,8 @@ export interface TokenUsage {
 export interface ChatResult {
   status: 'completed' | 'timeout' | 'error'
   text: string
+  /** status === 'error' 时的错误信息（turn/end reason.kind === 'error'）。 */
+  error?: string
   usage?: TokenUsage
 }
 

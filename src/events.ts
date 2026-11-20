@@ -21,6 +21,22 @@ import type { SessionEventView, TokenUsage } from './http-types.js'
 /** 单会话归档上限，超出丢最旧（规格「我替你做的决定」第 9 条）。 */
 const ARCHIVE_LIMIT = 10000
 
+/** turn/end 的 error reason 提取（reason.kind === 'error' 时的 message，unknown 安全）。 */
+function turnEndErrorOf(data: unknown): string | undefined {
+  if (typeof data !== 'object' || data === null) return undefined
+  const reason = (data as { reason?: unknown }).reason
+  if (typeof reason !== 'object' || reason === null) return undefined
+  if ((reason as { kind?: unknown }).kind !== 'error') return undefined
+  const error = (reason as { error?: unknown }).error
+  if (typeof error === 'string') return error
+  if (typeof error === 'object' && error !== null) {
+    const message = (error as { message?: unknown }).message
+    if (typeof message === 'string') return message
+  }
+  const message = (reason as { message?: unknown }).message
+  return typeof message === 'string' ? message : 'turn ended with error'
+}
+
 /** 一个会话的归档条目（SessionEvent 的视图投影）。 */
 interface Entry {
   view: SessionEventView
@@ -28,6 +44,11 @@ interface Entry {
   lastUsage?: TokenUsage
   /** 最后一条 assistant/message 的文本内容。 */
   lastAssistantText: string
+  /**
+   * 最近一个 turn/end 的 error 信息（reason.kind === 'error' 时有值；正常收
+   * 尾的 turn/end 清空）。滚动语义与 lastUsage 一致：取"最新 turn 的收尾"。
+   */
+  lastTurnError?: string
 }
 
 /** DSH TokenUsage（inputTokens/outputTokens/cacheReadTokens/cacheWriteTokens，可缺省）→ HTTP 视图。 */
@@ -96,6 +117,11 @@ export class EventArchive {
       lastAssistantText: event.type === 'assistant/message'
         ? textOf((event.data as { message?: unknown }).message)
         : (last?.lastAssistantText ?? ''),
+      // turn/end 更新错误收尾（error reason 设值、正常收尾清空）；其他事件
+      // 沿用 last（新 turn 开始时不预清——以该 turn 自己的收尾为准）。
+      lastTurnError: event.type === 'turn/end'
+        ? turnEndErrorOf(event.data)
+        : last?.lastTurnError,
     }
     entries.push(entry)
     // 环形截断丢最旧时，滚动派生字段随 last 条目保留（usage/text 不受丢旧影响）。
@@ -128,6 +154,16 @@ export class EventArchive {
   usageOf(sessionId: string): TokenUsage | undefined {
     const entries = this.sessions.get(sessionId)
     return entries === undefined || entries.length === 0 ? undefined : entries[entries.length - 1]?.lastUsage
+  }
+
+  /**
+   * 最近一个 turn/end 的错误信息（正常收尾为 undefined）。
+   * chatResultOf 消费：agent 转入 idle 但最新 turn 以 error 收尾时，
+   * prompt/wait/tasks 返回 status:'error' 而非 completed + 空文本。
+   */
+  lastTurnErrorOf(sessionId: string): string | undefined {
+    const entries = this.sessions.get(sessionId)
+    return entries === undefined || entries.length === 0 ? undefined : entries[entries.length - 1]?.lastTurnError
   }
 
   /** 归档里该会话最新的 turn 序号（tasks 路由的 taskId 后缀；无归档为 0）。 */

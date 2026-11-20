@@ -96,6 +96,16 @@ function sleep(ms: number): Promise<void> {
 
 /** 从已注册路径参数的会话出归档结果（prompt/wait 共用）。 */
 function chatResultOf(sessionId: string, archive: EventArchive, handle: AgentHandle, status: ChatResult['status']): ChatResult {
+  // 真实 DSH 实测（Mac rc.5）：模型调用失败（如缺 API key）时 turn 以
+  // reason.kind==='error' 收尾、agent 照常转 idle——completed + 空文本会把
+  // 错误吞掉。idle 收尾且最新 turn 以 error 结束时返回 status:'error' +
+  // 错误信息（timeout 时任务还在跑，错误归属未定，维持 timeout）。
+  if (status === 'completed') {
+    const error = archive.lastTurnErrorOf(sessionId)
+    if (error !== undefined) {
+      return { status: 'error', text: archive.lastAssistantTextOf(sessionId), error }
+    }
+  }
   return {
     status,
     text: archive.lastAssistantTextOf(sessionId),

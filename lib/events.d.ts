@@ -29,6 +29,12 @@ export declare class EventArchive {
     lastAssistantTextOf(sessionId: string): string;
     /** 最后一个 turn/end 的 usage。 */
     usageOf(sessionId: string): TokenUsage | undefined;
+    /**
+     * 最近一个 turn/end 的错误信息（正常收尾为 undefined）。
+     * chatResultOf 消费：agent 转入 idle 但最新 turn 以 error 收尾时，
+     * prompt/wait/tasks 返回 status:'error' 而非 completed + 空文本。
+     */
+    lastTurnErrorOf(sessionId: string): string | undefined;
     /** 归档里该会话最新的 turn 序号（tasks 路由的 taskId 后缀；无归档为 0）。 */
     lastTurnOf(sessionId: string): number;
     /** DELETE 会话时清归档（事件流已断，无需保留）。 */

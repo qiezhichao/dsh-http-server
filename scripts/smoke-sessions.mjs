@@ -44,6 +44,9 @@ const pluginDir = resolve(scriptDir, '..')
 
 const results = []
 
+/** 真实模式标志：probe 可达时置 true（DELETE 后 404 vs 自动 resume 的断言分叉）。 */
+let realMode = false
+
 function check(name, ok, detail) {
   results.push({ name, ok })
   console.log(`${ok ? '  PASS' : '  FAIL'}  ${name}${detail ? ' — ' + detail : ''}`)
@@ -324,17 +327,23 @@ async function assertAll(base) {
     check('5. POST wait → 200', false, error?.message || String(error))
   }
 
-  // 6. DELETE → 204；再 prompt → 404（无持久化会话时）
+  // 6. DELETE → 204；再 prompt：stub（无持久化）→ 404；真实 DSH（会话已持久化）
+  //    → 200 自动 resume——最终审查 Ruling：DELETE 定位为"内存会话处置"，
+  //    持久化会话可 resume 是设计行为，两种模式各自断言契约路径。
   try {
     const del = await fetchJson(`${base}${PREFIX}/sessions/${sessionId}`, { method: 'DELETE' })
     const after = await fetchJson(`${base}${PREFIX}/sessions/${sessionId}/prompt`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ prompt: '删后再问', timeoutMs: 60000 }),
     })
-    check('6. DELETE → 204；再 prompt → 404', del.status === 204 && after.status === 404 && after.body?.error === 'not found',
+    const expectNotFound = !realMode
+    const ok = expectNotFound
+      ? (del.status === 204 && after.status === 404 && after.body?.error === 'not found')
+      : (del.status === 204 && after.status === 200 && (after.body?.status === 'completed' || after.body?.status === 'error'))
+    check('6. DELETE → 204；再 prompt → 404（stub）/ 200 自动 resume（真实持久化）', ok,
       `delete=${del.status} after=${after.status} body=${JSON.stringify(after.body)}`)
   } catch (error) {
-    check('6. DELETE → 204；再 prompt → 404', false, error?.message || String(error))
+    check('6. DELETE → 204；再 prompt → 404（stub）/ 200 自动 resume（真实持久化）', false, error?.message || String(error))
   }
 
   // 7. cwd 逃逸 → 400
@@ -397,6 +406,7 @@ async function assertWin32Cwd(base) {
 async function main() {
   console.log(`smoke-sessions: DSH base = ${BASE}`)
   if (await probe()) {
+    realMode = true
     console.log('模式 A：对真实 DSH 实例断言（1-8 项；9/10 需 stub 注入，真实实例 SKIP）。')
     await assertAll(BASE)
   } else {
