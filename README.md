@@ -144,14 +144,18 @@ node scripts/smoke-standalone.mjs    # 双开验证（需先配 standalonePort: 
 预期输出（真实实例上）：每脚本逐项 `PASS`，结尾 `ALL PASS (n/n)`。各脚本断言集：
 
 - **smoke-health**（2 项）：health 200 固定 JSON；未知路径 404。
-- **smoke-sessions**（10 项）：建会话 201；同步 prompt completed；忙时 409；
-  events 含 turn/end 与 usage；`?since=` 增量；wait；DELETE 204 后 404；
-  cwd 逃逸 400；tasks 抛错后门闩已清；win32 cwd 模拟。
-- **smoke-stream**（17 项）：connected/delta/reasoning/tool/turn/end(usage)/done
-  帧序列与收流；无 chunk 全文差量补推；停滞看门狗；忙时 409；客户端断开门闩
-  已清；心跳基建；400/404；turn 归属；会话级 error 即时收流。
+- **smoke-sessions**（stub 10 项 / 真实 8 项，第 9/10 项需 stub 故障注入、真实实例自动 SKIP）：
+  建会话 201；同步 prompt completed；忙时 409；events 含 turn/end 与 usage；
+  `?since=` 增量；wait；DELETE 204 后再 prompt（**双模式**：stub 无持久化 → 404；
+  真实持久化会话 → 200 自动 resume，`status` completed/error）；cwd 逃逸 400；
+  tasks 抛错后门闩已清；win32 cwd 模拟。
+- **smoke-stream**（stub 17 项 + 真实可达时追加 5 项 R1-R5，共 21 项）：
+  connected/delta/reasoning/tool/turn/end(usage)/done 帧序列与收流；
+  无 chunk 全文差量补推；停滞看门狗；忙时 409；客户端断开门闩已清；心跳基建；
+  400/404；turn 归属；会话级 error 即时收流；真实流/409/400/404/断开复验。
 - **e2e-smoke**（9 项）：health → 建会话 → 需工具长任务 prompt → events 轮询
-  （含 tool/call）→ 增量游标 → wait → stream 另一轮 → DELETE 204 → 404 复验 →
+  （含 tool/call）→ 增量游标 → wait → stream 另一轮 → DELETE 204 → 同 id prompt
+  复验（stub → 404；真实持久化 → 200，error 不算通过）→
   跨重启恢复。**跨重启恢复为两段式**：第一轮跑完记下输出末尾的 `sessionId`，
   重启 DSH 后执行：
 
