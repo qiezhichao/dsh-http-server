@@ -293,8 +293,11 @@ function stubHandle(sessionId, ctx, persistence) {
       }
       emit('step/start', { turn, step: 1 })
       if (handle.mode === 'ask') {
-        // ask_user_question 挂起场景：tool/call 带 questions JSON + tool/result
-        // （空结果——timed 工具前台等待中）→ 不发 turn/end（等待回答）。
+        // ask_user_question open 状态：tool/call（questions JSON）后模拟 ask 工具
+        // 执行——waterfall dispatch（贴真实 UserQuestionService.ask 的分发路径），
+        // answerer（插件侧）挂起等答案；答案到达后 tool/result（带答案）+
+        // user/message（steer 视觉）+ turn/end 收尾。answerer reject（流收口/
+        // signal abort）时 ask 报错收尾（catch 静默——门闩由真实插件 cleanup 清）。
         const askCallId = `ask-${turn}`
         const questions = [
           { id: 'q1', text: '使用哪个部署环境？', options: [{ label: '测试' }, { label: '生产' }], multiSelect: false },
@@ -304,12 +307,20 @@ function stubHandle(sessionId, ctx, persistence) {
           turn, step: 1, callId: askCallId, name: 'ask_user_question',
           arguments: JSON.stringify({ questions }),
         })
-        emit('tool/result', {
-          turn, step: 1,
-          message: { role: 'tool', toolCallId: askCallId, content: [{ type: 'text', text: '' }], source: { kind: 'tool', callId: askCallId } },
-        })
-        // 登记进 stub userQuestions（真实侧由 projection 从 Session log 重建）
-        ctx.get('userQuestions')?.registerAsk?.(sessionId, askCallId, questions)
+        const noAnswerer = () => Promise.reject(new Error('NO_PROVIDER'))
+        ctx.waterfall('user-questions/request', { agent: handle.agent, questions }, noAnswerer)
+          .then((answer) => {
+            emit('tool/result', {
+              turn, step: 1,
+              message: { role: 'tool', toolCallId: askCallId, content: [{ type: 'text', text: JSON.stringify(answer) }], source: { kind: 'tool', callId: askCallId } },
+            })
+            emit('user/message', {
+              turn, step: 1,
+              message: { role: 'user', content: [{ type: 'text', text: JSON.stringify({ kind: 'answer_to_pending_question', answers: answer.answers }) }] },
+            })
+            handle.setIdleAfterAnswer()
+          })
+          .catch(() => { /* answerer reject：ask 报错收尾（真实侧 turn 以 error 收） */ })
         return
       }
       if (handle.mode === 'full') {
@@ -346,6 +357,21 @@ function makeStubCtx(persistence, root, handles) {
       if ( set === undefined) { set = new Set(); listeners.set(name, set) }
       set.add(cb)
       return () => set.delete(cb)
+    },
+    /** 贴 cordis Events.waterfall：[thisArg?, name, ...args, next]，外层优先逐层调。 */
+    waterfall(...args) {
+      const thisArg = (typeof args[0] === 'object' || typeof args[0] === 'function') && !Array.isArray(args[0]) && typeof args[0] !== 'string' ? args.shift() : null
+      const name = args.shift()
+      const inner = args.pop()
+      const cbs = [...(listeners.get(name) ?? [])]
+      const dispatch = () => {
+        const cb = cbs.shift()
+        if (!cb) return inner()
+        let called = false
+        const next = () => { if (called) throw new Error('next() called multiple times'); called = true; return dispatch() }
+        return cb(...args, next)
+      }
+      return dispatch()
     },
     effect: (fn) => fn(),
     emit: (name, ...args) => { for (const cb of [...(listeners.get(name) ?? [])]) cb(...args) },
@@ -442,7 +468,7 @@ async function startStubDsh(port) {
   })
   await new Promise((done) => server.listen(port, '127.0.0.1', done))
   return {
-    server, root, persistence, handles,
+    server, root, persistence, handles, ctx,
     cleanup: () => { server.close(); rmSync(root, { recursive: true, force: true }) },
   }
 }
@@ -605,10 +631,9 @@ async function assertStubSuite(base, stub) {
   {
     const sessionId = await createSession(base)
     stub.handles.get(sessionId).mode = 'ask'
-    // 流先开（收到 question 帧后回答），streamOnce 的 onFrame 挂 answer 回调
+    // open 全链路：流开 → question 帧 → 立即 POST /answer → 200 → 流续跑至 done
     let answerCallId
     const answered = (async () => {
-      // 等待 question 帧到达后回答（避免竞态：帧先到才可回答）
       await sleep(300)
       const call = await fetchJson(`${base}${PREFIX}/sessions/${sessionId}/answer`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -630,32 +655,78 @@ async function assertStubSuite(base, stub) {
         && questions[0]?.json?.questions?.[0]?.options?.[0]?.label === '测试',
       `question=${questions.length} json=${JSON.stringify(questions[0]?.json).slice(0, 120)}`)
     const call = await answered
-    check('Q2 answer 端点回传 → 200 {accepted: true}（回答注入 running turn）',
+    check('Q2 open 状态立即回答 → 200 {accepted: true}（waterfall answerer resolve）',
       call.status === 200 && call.body?.accepted === true,
       `status=${call.status} body=${JSON.stringify(call.body)}`)
-    check('Q3 回答后流续跑至收尾（turn/end + done 到达，question 后未误收流）',
-      framesOf(r.frames, 'turn/end').length === 1 && framesOf(r.frames, 'done').length === 1 && r.closed,
-      `turnEnd=${framesOf(r.frames, 'turn/end').length} done=${framesOf(r.frames, 'done').length} closed=${r.closed}`)
-    // Q4 answer 端点三态：未知 callId 404；结构坏 400；重复回答（queued）409
-    const unknown = await fetchJson(`${base}${PREFIX}/sessions/${sessionId}/answer`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ callId: 'no-such-call', answers: [{ id: 'q1', selected: ['x'] }] }),
-    })
-    const bad = await fetchJson(`${base}${PREFIX}/sessions/${sessionId}/answer`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ callId: 'ask-1', answers: [{ id: 'wrong-id', selected: ['x'] }] }),
-    })
-    const requeued = await fetchJson(`${base}${PREFIX}/sessions/${sessionId}/answer`, {
+    check('Q3 回答后流续跑至收尾（tool_result 带答案 + turn/end + done，question 后未误收流）',
+      framesOf(r.frames, 'tool_result').length === 1 && framesOf(r.frames, 'turn/end').length === 1
+        && framesOf(r.frames, 'done').length === 1 && r.closed,
+      `toolResult=${framesOf(r.frames, 'tool_result').length} turnEnd=${framesOf(r.frames, 'turn/end').length} done=${framesOf(r.frames, 'done').length} closed=${r.closed}`)
+    // open 收口后三态：重复回答（已 resolve）→ 404；未知 callId → 404
+    const reanswer = await fetchJson(`${base}${PREFIX}/sessions/${sessionId}/answer`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ callId: 'ask-1', answers: [
         { id: 'q1', selected: ['测试'] },
         { id: 'q2', selected: ['否'] },
       ] }),
     })
-    check('Q4 answer 三态：未知 callId → 404；批不匹配 → 400；重复回答 → 409',
-      unknown.status === 404 && unknown.body?.error === 'question not found'
-        && bad.status === 400 && requeued.status === 409 && requeued.body?.error === 'reply queued',
-      `unknown=${unknown.status} bad=${bad.status} requeued=${requeued.status}(${JSON.stringify(requeued.body)})`)
+    const unknown = await fetchJson(`${base}${PREFIX}/sessions/${sessionId}/answer`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ callId: 'no-such-call', answers: [{ id: 'q1', selected: ['x'] }] }),
+    })
+    check('Q4 open 收口后：重复回答 → 404（已 resolve 无挂起）；未知 callId → 404',
+      reanswer.status === 404 && reanswer.body?.error === 'question not found'
+        && unknown.status === 404 && unknown.body?.error === 'question not found',
+      `reanswer=${reanswer.status} unknown=${unknown.status}`)
+  }
+
+  // Q5 open 挂起中坏批 → 400（本地批校验：每题恰一项、id 一一对应）
+  {
+    const sessionId = await createSession(base)
+    stub.handles.get(sessionId).mode = 'ask'
+    const answered = (async () => {
+      await sleep(300)
+      const badBatch = await fetchJson(`${base}${PREFIX}/sessions/${sessionId}/answer`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ callId: 'ask-1', answers: [{ id: 'wrong-id', selected: ['x'] }] }),
+      })
+      const goodBatch = await fetchJson(`${base}${PREFIX}/sessions/${sessionId}/answer`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ callId: 'ask-1', answers: [
+          { id: 'q1', selected: ['测试'] },
+          { id: 'q2', selected: ['否'] },
+        ] }),
+      })
+      return { badBatch, goodBatch }
+    })()
+    const r = await streamOnce(base, sessionId, { prompt: '问我要部署环境', stallTimeoutMs: 30000 })
+    const { badBatch, goodBatch } = await answered
+    check('Q5 open 挂起中坏批 → 400 invalid answer batch；随后正确批 → 200',
+      badBatch.status === 400 && badBatch.body?.error === 'invalid answer batch'
+        && goodBatch.status === 200 && goodBatch.body?.accepted === true,
+      `bad=${badBatch.status}(${JSON.stringify(badBatch.body)}) good=${goodBatch.status}`)
+    check('Q5b 坏批不收口挂起（流仍等答案），正确批后正常收尾',
+      framesOf(r.frames, 'turn/end').length === 1 && framesOf(r.frames, 'done').length === 1 && r.closed,
+      `turnEnd=${framesOf(r.frames, 'turn/end').length} done=${framesOf(r.frames, 'done').length} closed=${r.closed}`)
+  }
+
+  // Q6 continued 路径回落（waterfall 无挂起时 userQuestions.answer 旧机制）
+  {
+    const sessionId = await createSession(base)
+    // 手动登记 continued 状态的问题（模拟 DSH 旧投影：真实侧由 web 客户端历史对话重建）
+    stub.ctx.get('userQuestions').registerAsk(sessionId, 'cont-1', [{ id: 'c1', text: '继续吗？', options: [{ label: '是' }] }])
+    const first = await fetchJson(`${base}${PREFIX}/sessions/${sessionId}/answer`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ callId: 'cont-1', answers: [{ id: 'c1', selected: ['是'] }] }),
+    })
+    const second = await fetchJson(`${base}${PREFIX}/sessions/${sessionId}/answer`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ callId: 'cont-1', answers: [{ id: 'c1', selected: ['是'] }] }),
+    })
+    check('Q6 continued 回落：首次 answer → 200（steer 注入）；重复 → 409 reply queued',
+      first.status === 200 && first.body?.accepted === true
+        && second.status === 409 && second.body?.error === 'reply queued',
+      `first=${first.status} second=${second.status}(${JSON.stringify(second.body)})`)
   }
 
   // S7 body 无 prompt → 400；未知 session → 404

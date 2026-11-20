@@ -9,6 +9,10 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { AgentHandle } from '@deepseek-ai/dsh-agent'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
+// 类型 side-effect import：dsh-user-questions 的 types.d.ts 经 declare module
+// 把 'user-questions/request' waterfall 事件并入 cordis Events 接口——
+// 不引入则 ctx.on('user-questions/request') 无类型（运行时事件由宿主提供）。
+import type { AskUserQuestionAnswer } from '@deepseek-ai/dsh-user-questions'
 import type { EventArchive } from './events.js'
 import { CwdEscapeError, NotFoundError, SessionStore } from './sessions.js'
 import type { SessionRecord } from './sessions.js'
@@ -284,6 +288,39 @@ function handleStream(
     }
   })
 
+  // open 状态 ask_user_question 的 answerer（照 dsh-sdk-jsonrpc-server
+  // SdkUserQuestionBridge 的官方挂法）：ctx.on("user-questions/request",
+  // (request, next) => ...)——agent 归属本会话时接手（登记 record.pendingAsk
+  // 并返回 pending Promise 挂起 waterfall），等 HTTP /answer resolve({answers})；
+  // 非本会话则 return next() 让给其他 answerer（web UI 等）。
+  // ask 的 waterfall dispatch 带 scopeTarget(agent, agent) 过滤——插件 ctx 无
+  // scope tag 时放行（见 dsh-scope scopeTarget 的 filter 实现），故全局 on 可达。
+  const unsubscribeAnswerer = ctx.on('user-questions/request', async (request: { agent?: unknown; questions?: unknown; signal?: AbortSignal | undefined }, next: () => Promise<AskUserQuestionAnswer>): Promise<AskUserQuestionAnswer> => {
+    if (cleanedUp) return next()
+    const agent = request.agent
+    if (agent !== record.handle.agent) return next()
+    const questions = request.questions
+    if (!Array.isArray(questions) || questions.length === 0) return next()
+    // signal abort（turn 取消/超时）时收口 pending，防悬挂
+    const signal = request.signal
+    return new Promise<AskUserQuestionAnswer>((resolve, reject) => {
+      const settle = () => {
+        if (record.pendingAsk?.reject === reject) record.pendingAsk = undefined
+      }
+      if (signal !== undefined) {
+        signal.addEventListener('abort', () => {
+          settle()
+          reject(new Error('dsh-http-server: ask aborted before the question was answered'))
+        }, { once: true })
+      }
+      record.pendingAsk = {
+        questions: questions as Array<{ id: unknown }>,
+        resolve: (answer) => { settle(); resolve(answer as AskUserQuestionAnswer) },
+        reject: (error) => { settle(); reject(error) },
+      }
+    })
+  })
+
   // 独立于归档的自持订阅（照 dsh-webapi 模式过滤 session.id，不复用归档通道）
   const unsubscribe = ctx.on('session/event', (session: Session, event: SessionEvent) => {
     if (String(session.id) !== sessionId) return
@@ -355,6 +392,9 @@ function handleStream(
           try {
             const parsed = JSON.parse(args) as { questions?: unknown }
             if (Array.isArray(parsed.questions)) {
+              // 记 callId 锚：open 状态 /answer 的 callId 校验用它
+              // （waterfall answerer 的 request 无 callId，配对靠会话级唯一挂起）
+              record.lastQuestionCallId = callIdStr
               sse.send('question', { callId: callIdStr, questions: parsed.questions, seq: view.seq })
             } else {
               sse.send('tool', { name: nameStr, arguments: args, callId: callIdStr, seq: view.seq })
@@ -449,6 +489,11 @@ function handleStream(
       /* 退订尽力 */
     }
     try {
+      unsubscribeAnswerer()
+    } catch {
+      /* 退订尽力 */
+    }
+    try {
       unsubscribe()
     } catch {
       /* 退订尽力 */
@@ -459,6 +504,17 @@ function handleStream(
       /* 停心跳尽力 */
     }
     if (watchdog !== undefined) clearTimeout(watchdog)
+    // 残留 open ask（流收口时仍未回答）：reject 收口——不 reject 的话
+    // waterfall 挂着、ask 工具不返回、handle 永远 running（此后全 409）。
+    const ask = record.pendingAsk
+    record.pendingAsk = undefined
+    if (ask !== undefined) {
+      try {
+        ask.reject(new Error('dsh-http-server: stream closed before the question was answered'))
+      } catch {
+        /* reject 侧已收口 */
+      }
+    }
     store.clearBusy(sessionId)
     sse.close()
   }
@@ -751,6 +807,34 @@ export function match(req: IncomingMessage, res: ServerResponse, subPath: string
           return
         }
         sendError(res, 500, String(error))
+        return
+      }
+      // 通道优先级：open（waterfall answerer 挂起等答案，随 stream 生命周期）
+      // → continued（userQuestions.answer steer 旧机制）。两者均为 DSH 真实
+      // 双路径：ask 的 waterfall 无 answerer 接手时 noAnswerer → DSH 落
+      // continued 投影（web 客户端两路都有）；流已收口时 pendingAsk 已被
+      // cleanup reject 清空，自然落 continued。
+      const pendingAsk = record.pendingAsk
+      if (pendingAsk !== undefined) {
+        // open 状态：callId 必须锚定当前挂起问题（question 帧记录的 callId）
+        if (record.lastQuestionCallId !== body.callId) {
+          sendJson(res, 404, { error: 'question not found' })
+          return
+        }
+        // 本地批校验（贴 parseHostAnswer 语义：每题恰一项、id 一一对应）
+        const ids = new Set(pendingAsk.questions.map((question) => String(question.id)))
+        const answered = new Set(body.answers.map((item) => item.id))
+        if (answered.size !== body.answers.length
+          || pendingAsk.questions.length !== body.answers.length
+          || !pendingAsk.questions.every((question) => answered.has(String(question.id)))) {
+          sendJson(res, 400, { error: 'invalid answer batch', detail: 'the answer batch must name each question exactly once' })
+          return
+        }
+        record.pendingAsk = undefined
+        // resolve waterfall answerer → ask 工具拿到答案 → turn 续跑 → 流继续
+        // （user/message → 后续 step → turn/end → done）
+        pendingAsk.resolve({ answers: body.answers })
+        sendJson(res, 200, { accepted: true })
         return
       }
       const userQuestions = ctx.get('userQuestions') as

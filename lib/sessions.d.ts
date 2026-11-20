@@ -22,11 +22,34 @@ export declare class NotFoundError extends Error {
 export declare class CwdEscapeError extends Error {
     constructor(cwd: string, root: string);
 }
+/**
+ * open 状态的 ask_user_question 挂起（stream 生命周期内）：
+ * agent 调 ask 工具 → UserQuestionService.ask 经 `user-questions/request`
+ * waterfall 分发 → 本插件 answerer 捕获（agent 归属本会话）→ 登记本记录，
+ * 返回 pending Promise 等 HTTP /answer 的 resolve({answers})。
+ * cleanup（收流/断开）时 reject，防 handle 永挂 running。
+ */
+export interface PendingAsk {
+    /** 本批问题（id 集合校验用：answer 批每题恰一项、id 一一对应）。 */
+    questions: Array<{
+        id: unknown;
+    }>;
+    /** waterfall answerer 返回的 pending Promise 的 resolve。 */
+    resolve: (answer: {
+        answers: unknown;
+    }) => void;
+    /** 同一 Promise 的 reject（流收口时触发 ASK 收尾）。 */
+    reject: (error: unknown) => void;
+}
 /** 一个在册会话：agent 句柄、resolve 后的 cwd、忙闲门闩。 */
 export interface SessionRecord {
     handle: AgentHandle;
     cwd: string;
     busy: boolean;
+    /** open 状态挂起的 ask（stream answerer 登记；无则 undefined）。 */
+    pendingAsk?: PendingAsk;
+    /** 最近一次 question 帧的 tool call id（open 状态 /answer 的 callId 校验锚）。 */
+    lastQuestionCallId?: string;
 }
 /** 会话登记簿：创建/恢复/忙闩/删除，与归档清理解耦。 */
 export declare class SessionStore {
