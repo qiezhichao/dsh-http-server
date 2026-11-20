@@ -16,7 +16,7 @@ DSH 插件（bundle）。在一个 DSH 宿主进程内提供会话全生命周�
 | GET | `/sessions/:id/events?since=N` | 事件增量轮询 → `{events, nextSince, status, lastAssistantText}` |
 | POST | `/sessions/:id/wait` | 等待在跑任务收敛 → `200 {status, text, error?, usage?}` |
 | POST | `/sessions/:id/stream` | SSE 流式（connected/delta/reasoning/tool/**tool_result**/**question**/turn/end/done 帧；心跳 15s；停滞看门狗） |
-| POST | `/sessions/:id/answer` | 回答流中挂起的 `ask_user_question` → `200 {accepted:true}`（不占忙闩；`404 question not found` / `400` 坏批 / `409 reply queued`） |
+| POST | `/sessions/:id/answer` | 回答流中挂起的 `ask_user_question` → `200 {accepted:true}`（不占忙闩；双通道 open→continued，见下；`404 question not found` / `400` 坏批 / `409 reply queued`） |
 | DELETE | `/sessions/:id` | 处置会话 → `204`（幂等；内存处置语义，见下「跨重启恢复」） |
 
 错误契约：`409 {"error":"session busy"}`、`404 {"error":"not found"}`、
@@ -34,11 +34,19 @@ tool 帧的 arguments JSON）；消费方渲染选项，用户选择后调
 ```
 
 `answers` 逐题一批：每题恰一项、`id` 与 question 帧的 `questions[].id` 一一
-对应。回答经 DSH `userQuestions.answer` **steer 成 user 消息注入 running
-turn**——不占忙闩（不判不清 busy），流随即续跑（user/message → 后续
-step → turn/end）。三态：`200`（接受）；`404 question not found`（无该
-callId 的可回答问题——已答/超时/不存在）；`400`（批结构不合法）；`409
-reply queued`（该问题已有排队回复）。
+对应。回答按**双通道**优先级分发（均为 DSH 真实路径）：
+
+- **open（流内挂起）**：stream 生命周期内插件在 `user-questions/request`
+  cordis waterfall 上挂 answerer（照官方 sdk-server 挂法）——ask 挂起时
+  pending 等答案，`/answer` 到达即 resolve，流随即续跑（tool_result 带答案 →
+  user/message → turn/end → done）。callId 锚定 question 帧的 callId。
+- **continued（回落）**：流已收口或无挂起时，经 DSH `userQuestions.answer`
+  把回答 steer 成 user 消息注入（web 客户端两路都有）。
+
+两路都**不占忙闩**（不判不清 busy）。三态：`200`（接受）；`404 question
+not found`（无该 callId 的可回答问题——已答/超时/不存在）；`400`（批结构
+不合法）；`409 reply queued`（continued 路径重复提交）。流收口时残留挂起
+问会被 reject 收口（防 turn 永挂 running）。
 
 用户不回答时：流停滞 `stallTimeoutMs`（默认 300s）后看门狗报
 `turn stalled` 收流；模型侧 timed ask 自带超时也会先收尾。
@@ -182,12 +190,14 @@ node scripts/smoke-standalone.mjs    # 双开验证（需先配 standalonePort: 
   `?since=` 增量；wait；DELETE 204 后再 prompt（**双模式**：stub 无持久化 → 404；
   真实持久化会话 → 200 自动 resume，`status` completed/error）；cwd 逃逸 400；
   tasks 抛错后门闩已清；win32 cwd 模拟。
-- **smoke-stream**（stub 21 项 + 真实可达时追加 5 项 R1-R5，共 26 项）：
+- **smoke-stream**（stub 24 项 + 真实可达时追加 5 项 R1-R5，共 29 项）：
   connected/delta/reasoning/tool/turn/end(usage)/done 帧序列与收流；
   **token 流经 `agent/assistant-stream` 通道注入（贴真实 DSH），逐 chunk →
   逐 delta 帧**；tool 帧含 callId + **tool_result 帧外发工具结果**（callId
-  配对）；**question 帧（ask_user_question 结构化外发）+ answer 端点全链路
-  （Q1-Q4：question 渲染 → 回答 → 流续跑收尾 → 三态 404/400/409）**；
+  配对）；**question 帧 + answer 端点双通道全链路**（Q1-Q6：open 挂起时
+  立即回答 200 → 流续跑收尾（走 waterfall dispatch，贴真实
+  UserQuestionService.ask 路径）；收口后重复 → 404；挂起中坏批 → 400 不
+  收口；continued 回落 200 + 重复 409）；
   无 chunk 全文差量补推；停滞看门狗；忙时 409；客户端断开门闩已清；心跳基建；
   400/404；turn 归属；会话级 error 即时收流；真实流 **R1 断言逐 token
   delta > 1 帧（真流式标准）**/409/400/404/断开复验。
