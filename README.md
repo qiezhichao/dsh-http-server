@@ -11,10 +11,10 @@ DSH 插件（bundle）。在一个 DSH 宿主进程内提供会话全生命周�
 |---|---|---|
 | GET | `/health` | 健康检查 + 模型目录 `{ok, service, version, providers, models}` |
 | POST | `/sessions` | 建会话 → `201 {sessionId, cwd}`（body 可选 `cwd`/`model`，受 `workspaceRoot` 沙箱约束） |
-| POST | `/sessions/:id/prompt` | 同步提问 → `200 {status, text, usage?}`（`status`: completed/timeout/error） |
+| POST | `/sessions/:id/prompt` | 同步提问 → `200 {status, text, error?, usage?}`（`status`: completed/timeout/error；turn 以 error 收尾时 `error` 带原因，如模型路由无 key） |
 | POST | `/sessions/:id/tasks` | 异步任务 → `202 {taskId}`（完成与否经 events 轮询 turn/end 判定） |
 | GET | `/sessions/:id/events?since=N` | 事件增量轮询 → `{events, nextSince, status, lastAssistantText}` |
-| POST | `/sessions/:id/wait` | 等待在跑任务收敛 → `200 {status, text, usage?}` |
+| POST | `/sessions/:id/wait` | 等待在跑任务收敛 → `200 {status, text, error?, usage?}` |
 | POST | `/sessions/:id/stream` | SSE 流式（connected/delta/reasoning/tool/turn/end/done 帧；心跳 15s；停滞看门狗） |
 | DELETE | `/sessions/:id` | 处置会话 → `204`（幂等；内存处置语义，见下「跨重启恢复」） |
 
@@ -156,8 +156,10 @@ node scripts/smoke-standalone.mjs    # 双开验证（需先配 standalonePort: 
   tasks 抛错后门闩已清；win32 cwd 模拟。
 - **smoke-stream**（stub 17 项 + 真实可达时追加 5 项 R1-R5，共 21 项）：
   connected/delta/reasoning/tool/turn/end(usage)/done 帧序列与收流；
-  无 chunk 全文差量补推；停滞看门狗；忙时 409；客户端断开门闩已清；心跳基建；
-  400/404；turn 归属；会话级 error 即时收流；真实流/409/400/404/断开复验。
+  **token 流经 `agent/assistant-stream` 通道注入（贴真实 DSH），逐 chunk →
+  逐 delta 帧**；无 chunk 全文差量补推；停滞看门狗；忙时 409；客户端断开
+  门闩已清；心跳基建；400/404；turn 归属；会话级 error 即时收流；真实流
+  **R1 断言逐 token delta > 1 帧（真流式标准）**/409/400/404/断开复验。
 - **e2e-smoke**（9 项）：health → 建会话 → 需工具长任务 prompt → events 轮询
   （含 tool/call）→ 增量游标 → wait → stream 另一轮 → DELETE 204 → 同 id prompt
   复验（stub → 404；真实持久化 → 200，error 不算通过）→
