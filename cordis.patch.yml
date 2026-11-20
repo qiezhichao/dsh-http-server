@@ -1,0 +1,15 @@
+# dsh-http-server bundle layer: insert the plugin row.
+# name 相对本 patch 文件所在目录解析（CLI 语义：relative plugin names in
+# inserted rows resolve beside their patch file）——--patch 本地调试 /
+# git 直装 / dsh plugin add 安装三路径通吃，无需改动。
+- insert:
+    - id: dsh-http-server
+      name: './lib/index.js'
+      # config:                     # 可选：插件配置（缺省全部走 Config 默认值；
+      #                             # 注意 patch 层替换整行 config，非深合并）
+      #   standalonePort: 3100      # standalone 独立端口（默认 0 = 禁用，仅宿主挂载；
+      #                             # >0 时与宿主 webServer 端口并存，两栖同一路由）
+      #   standaloneHost: 127.0.0.1
+      #   pathPrefix: /api/v1
+      #   agentPreset: standard
+      #   workspaceRoot: /absolute/workspace/root

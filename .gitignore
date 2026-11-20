@@ -1,0 +1,8 @@
+.superpowers/
+node_modules/
+lib-test/
+openspec/
+log/
+docs/superpowers/
+.trae/
+.DS_Store
