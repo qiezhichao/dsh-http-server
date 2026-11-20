@@ -204,6 +204,11 @@ function stubPersistence(root) {
  *  - 'slow'：turn/start 立即，chunks 每 200ms 一片、1200ms 收尾（409/断开/turn 归属场景）
  *  - 'error'：turn/start 后注入会话级 error 事件（带真实 message），不发 step/turn/end
  *    ——严格模拟 error 终结流且无正常收尾：缺 error 分支时流只能等看门狗（S9 场景）
+ *  - 'ask'：turn/start → step/start → tool/call(ask_user_question, arguments 含
+ *    questions 数组) → tool/result(空) 后**挂起等回答**（不发 turn/end）——
+ *    消费方经 POST /answer 回传后由 stub userQuestions.answer 注入 user/message
+ *    续流；不回答则由看门狗/模型超时收流（Q1-Q4 场景）。回答后 handle 转 idle
+ *    由 finishAsk 模拟（answer 后 100ms turn/end）
  */
 function stubHandle(sessionId, ctx, persistence) {
   let seq = persistence.startSeqOf(sessionId)
@@ -213,6 +218,13 @@ function stubHandle(sessionId, ctx, persistence) {
   const handle = {
     mode: 'full',
     disposed: false,
+    /** ask 场景回答后续跑收尾：turn/end + 转 idle + 解锁 waiters（answer 注入触发）。 */
+    setIdleAfterAnswer() {
+      emit('turn/end', { turn: 1, reason: { kind: 'completed' } })
+      status = 'idle'
+      const waiters = idleWaiters.splice(0)
+      for (const w of waiters) w()
+    },
     agent: {
       session: { id: sessionId, header: { cwd: persistence.cwdOf(sessionId) }, get seq() { return seq } },
       get status() { return status },
@@ -280,13 +292,33 @@ function stubHandle(sessionId, ctx, persistence) {
         return
       }
       emit('step/start', { turn, step: 1 })
+      if (handle.mode === 'ask') {
+        // ask_user_question 挂起场景：tool/call 带 questions JSON + tool/result
+        // （空结果——timed 工具前台等待中）→ 不发 turn/end（等待回答）。
+        const askCallId = `ask-${turn}`
+        const questions = [
+          { id: 'q1', text: '使用哪个部署环境？', options: [{ label: '测试' }, { label: '生产' }], multiSelect: false },
+          { id: 'q2', text: '需要回滚吗？', options: [{ label: '是' }, { label: '否' }] },
+        ]
+        emit('tool/call', {
+          turn, step: 1, callId: askCallId, name: 'ask_user_question',
+          arguments: JSON.stringify({ questions }),
+        })
+        emit('tool/result', {
+          turn, step: 1,
+          message: { role: 'tool', toolCallId: askCallId, content: [{ type: 'text', text: '' }], source: { kind: 'tool', callId: askCallId } },
+        })
+        // 登记进 stub userQuestions（真实侧由 projection 从 Session log 重建）
+        ctx.get('userQuestions')?.registerAsk?.(sessionId, askCallId, questions)
+        return
+      }
       if (handle.mode === 'full') {
         emitStream('chunk', { type: 'reasoning-delta', text: '思考中' })
         for (const t of ['1\n', '2\n', '3\n']) {
           emitStream('chunk', { type: 'text-delta', text: t })
         }
         emit('tool/call', { turn, step: 1, callId: 'c1', name: 'list_files', arguments: '{"path":"."}' })
-        emit('tool/result', { turn, step: 1, message: { role: 'tool', content: [] } })
+        emit('tool/result', { turn, step: 1, message: { role: 'tool', toolCallId: 'c1', content: [{ type: 'text', text: 'file-a\nfile-b' }], source: { kind: 'tool', callId: 'c1' } } })
         // 全文含未流式尾巴「4\n5\n」→ 差量补推必须补上且不重复
         finishTurn(turn, '1\n2\n3\n4\n5\n',
           { inputTokens: 12, outputTokens: 34, cacheReadTokens: 5, cacheWriteTokens: 0, totalTokens: 46 })
@@ -300,14 +332,18 @@ function stubHandle(sessionId, ctx, persistence) {
   return handle
 }
 
-/** stub ctx：session/event 事件总线（on 返回退订器）+ effect 即装 + agents/persistence。 */
+/** stub ctx：session/event 事件总线（on 返回退订器）+ effect 即装 + agents/persistence + userQuestions。 */
 function makeStubCtx(persistence, root, handles) {
   const listeners = new Map()
+  // 单例：ctx.get('userQuestions') 多次调用必须返回同一实例（registerAsk 登记
+  // 与 answer 查询共享同一 waiting Map）
+  const userQuestions = stubUserQuestions(handles, () => ctx)
   const ctx = {
-    get: (name) => (name === 'sessionPersistence' ? persistence : undefined),
+    get: (name) => (name === 'sessionPersistence' ? persistence
+      : name === 'userQuestions' ? userQuestions : undefined),
     on: (name, cb) => {
       let set = listeners.get(name)
-      if (set === undefined) { set = new Set(); listeners.set(name, set) }
+      if ( set === undefined) { set = new Set(); listeners.set(name, set) }
       set.add(cb)
       return () => set.delete(cb)
     },
@@ -331,6 +367,58 @@ function makeStubCtx(persistence, root, handles) {
     },
   }
   return ctx
+}
+
+/**
+ * stub userQuestions（贴 dsh-user-questions UserQuestionService.answer 语义）：
+ * 回答 steer 成 user 消息注入 running turn（经 session/event 总线的 user/message
+ * 事件模拟），turn 随后收尾——模拟回答后 agent 拿到答案继续跑完。
+ * 错误码 BAD_ANSWER / REPLY_QUEUED 按 rc.5 真实错误形状。
+ */
+function stubUserQuestions(handles, getCtx) {
+  // 每会话在等待的 ask_user_question：callId → { questions, queued }
+  const waiting = new Map()
+  const svc = {
+    /** 测试注入入口：stub handle 调 ask_user_question 时登记。 */
+    registerAsk(sessionId, callId, questions) {
+      const calls = waiting.get(sessionId) ?? new Map()
+      calls.set(callId, { questions, queued: false })
+      waiting.set(sessionId, calls)
+    },
+    answer(agent, callId, answer) {
+      const sessionId = String(agent.session.id)
+      const call = waiting.get(sessionId)?.get(callId)
+      if (call === undefined) return false
+      // 批校验先于 queued 判定（坏批 400 不应被已答 409 掩盖——贴真实语义：
+      // 服务端先校验批结构合法，再判该问题是否已有排队回复）
+      const ids = new Set(call.questions.map((q) => q.id))
+      const answered = new Set(answer.answers.map((a) => a.id))
+      if (answered.size !== answer.answers.length
+        || call.questions.length !== answer.answers.length
+        || !call.questions.every((q) => answered.has(q.id))) {
+        const err = new Error(`the answer batch for ${callId} must name each question exactly once`)
+        err.code = 'BAD_ANSWER'
+        throw err
+      }
+      if (call.queued) {
+        const err = new Error('a reply is already queued for this question')
+        err.code = 'REPLY_QUEUED'
+        throw err
+      }
+      call.queued = true
+      // steer：回答注入为 user 消息（session/event 总线），agent 拿到答案续跑
+      // 100ms 后 turn/end 收尾 + handle 转 idle（handle 转态经 handles 注册表
+      // ——stubHandle 内部闭包，此处从 handles 取 handle.setIdle）。
+      const ctx = getCtx()
+      ctx.emit('session/event', { id: sessionId }, {
+        type: 'user/message', seq: agent.session.seq + 1, time: Date.now(),
+        data: { turn: 1, step: 1, message: { role: 'user', content: [{ type: 'text', text: JSON.stringify({ kind: 'answer_to_pending_question', answers: answer.answers }) }] } },
+      })
+      setTimeout(() => handles.get(sessionId)?.setIdleAfterAnswer?.(), 100)
+      return true
+    },
+  }
+  return svc
 }
 
 async function startStubDsh(port) {
@@ -388,9 +476,15 @@ async function assertStubSuite(base, stub) {
       reasoning.length === 1 && reasoning[0]?.json?.delta === '思考中',
       `reasoning=${reasoning.length}`)
     const tool = framesOf(r.frames, 'tool')
-    check('S1 tool 帧（tool/call → {name, arguments, seq}）',
-      tool.length === 1 && tool[0]?.json?.name === 'list_files' && tool[0]?.json?.arguments === '{"path":"."}',
+    check('S1 tool 帧（tool/call → {name, arguments, callId, seq}）',
+      tool.length === 1 && tool[0]?.json?.name === 'list_files' && tool[0]?.json?.arguments === '{"path":"."}'
+        && typeof tool[0]?.json?.callId === 'string',
       `tool=${tool.length} json=${JSON.stringify(tool[0]?.json)}`)
+    const toolResults = framesOf(r.frames, 'tool_result')
+    check('S1 tool_result 帧（tool/result → {callId, text, seq}；与 tool 帧经 callId 配对）',
+      toolResults.length === 1 && toolResults[0]?.json?.callId === tool[0]?.json?.callId
+        && toolResults[0]?.json?.text === 'file-a\nfile-b',
+      `tool_result=${toolResults.length} json=${JSON.stringify(toolResults[0]?.json)}`)
     const turnEnd = framesOf(r.frames, 'turn/end')
     const done = framesOf(r.frames, 'done')
     const usage = turnEnd[0]?.json?.usage
@@ -505,6 +599,63 @@ async function assertStubSuite(base, stub) {
         && String(error[0]?.json?.message ?? '').includes('模型调用失败（注入错误）')
         && done.length === 1 && r.closed && elapsed < 4000,
       `error=${JSON.stringify(error[0]?.json)} done=${done.length} closed=${r.closed} elapsed=${elapsed}ms<5000ms`)
+  }
+
+  // Q1-Q4 ask_user_question 场景：question 帧渲染 + answer 端点回传 + 续流收尾
+  {
+    const sessionId = await createSession(base)
+    stub.handles.get(sessionId).mode = 'ask'
+    // 流先开（收到 question 帧后回答），streamOnce 的 onFrame 挂 answer 回调
+    let answerCallId
+    const answered = (async () => {
+      // 等待 question 帧到达后回答（避免竞态：帧先到才可回答）
+      await sleep(300)
+      const call = await fetchJson(`${base}${PREFIX}/sessions/${sessionId}/answer`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ callId: answerCallId, answers: [
+          { id: 'q1', selected: ['测试'] },
+          { id: 'q2', selected: ['否'] },
+        ] }),
+      })
+      return call
+    })()
+    const r = await streamOnce(base, sessionId, { prompt: '问我要部署环境', stallTimeoutMs: 30000 }, {
+      onFrame: (f) => { if (f.event === 'question') answerCallId = f.json?.callId },
+    })
+    const questions = framesOf(r.frames, 'question')
+    check('Q1 question 帧（ask_user_question → {callId, questions, seq}，问题/选项结构化外发）',
+      questions.length === 1 && questions[0]?.json?.callId === 'ask-1'
+        && questions[0]?.json?.questions?.length === 2
+        && questions[0]?.json?.questions?.[0]?.id === 'q1'
+        && questions[0]?.json?.questions?.[0]?.options?.[0]?.label === '测试',
+      `question=${questions.length} json=${JSON.stringify(questions[0]?.json).slice(0, 120)}`)
+    const call = await answered
+    check('Q2 answer 端点回传 → 200 {accepted: true}（回答注入 running turn）',
+      call.status === 200 && call.body?.accepted === true,
+      `status=${call.status} body=${JSON.stringify(call.body)}`)
+    check('Q3 回答后流续跑至收尾（turn/end + done 到达，question 后未误收流）',
+      framesOf(r.frames, 'turn/end').length === 1 && framesOf(r.frames, 'done').length === 1 && r.closed,
+      `turnEnd=${framesOf(r.frames, 'turn/end').length} done=${framesOf(r.frames, 'done').length} closed=${r.closed}`)
+    // Q4 answer 端点三态：未知 callId 404；结构坏 400；重复回答（queued）409
+    const unknown = await fetchJson(`${base}${PREFIX}/sessions/${sessionId}/answer`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ callId: 'no-such-call', answers: [{ id: 'q1', selected: ['x'] }] }),
+    })
+    const bad = await fetchJson(`${base}${PREFIX}/sessions/${sessionId}/answer`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ callId: 'ask-1', answers: [{ id: 'wrong-id', selected: ['x'] }] }),
+    })
+    const requeued = await fetchJson(`${base}${PREFIX}/sessions/${sessionId}/answer`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ callId: 'ask-1', answers: [
+        { id: 'q1', selected: ['测试'] },
+        { id: 'q2', selected: ['否'] },
+      ] }),
+    })
+    check('Q4 answer 三态：未知 callId → 404；批不匹配 → 400；重复回答 → 409',
+      unknown.status === 404 && unknown.body?.error === 'question not found'
+        && bad.status === 400 && requeued.status === 409 && requeued.body?.error === 'reply queued',
+      `unknown=${unknown.status} bad=${bad.status} requeued=${requeued.status}(${JSON.stringify(requeued.body)})`)
   }
 
   // S7 body 无 prompt → 400；未知 session → 404

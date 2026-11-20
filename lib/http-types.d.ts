@@ -29,6 +29,22 @@ export interface StreamBody {
     /** 停滞看门狗毫秒数：持续该时长无任何会话事件才收流（非整轮时长上限）。 */
     stallTimeoutMs?: number;
 }
+/** ask_user_question 单题回答项（贴 DSH AskUserQuestionAnswerItem 形状）。 */
+export interface AnswerItemBody {
+    /** 所答问题的 id（question 帧的 questions[].id）。 */
+    id: string;
+    /** 选中的选项 label 数组（单选一元素）。 */
+    selected: string[];
+    /** 自由文本「其他」答案（可选）。 */
+    custom?: string;
+}
+/** POST /sessions/:id/answer 请求体：回答流中挂起的 ask_user_question 调用。 */
+export interface AnswerBody {
+    /** question 帧携带的 tool call id。 */
+    callId: string;
+    /** 逐题回答一批：每题恰一项、id 与问题一一对应（服务端校验）。 */
+    answers: AnswerItemBody[];
+}
 /** token 用量视图（DSH TokenUsage 的 HTTP 投影，字段名为适配 Java 的短名）。 */
 export interface TokenUsage {
     input: number;

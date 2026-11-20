@@ -15,11 +15,39 @@ DSH 插件（bundle）。在一个 DSH 宿主进程内提供会话全生命周�
 | POST | `/sessions/:id/tasks` | 异步任务 → `202 {taskId}`（完成与否经 events 轮询 turn/end 判定） |
 | GET | `/sessions/:id/events?since=N` | 事件增量轮询 → `{events, nextSince, status, lastAssistantText}` |
 | POST | `/sessions/:id/wait` | 等待在跑任务收敛 → `200 {status, text, error?, usage?}` |
-| POST | `/sessions/:id/stream` | SSE 流式（connected/delta/reasoning/tool/turn/end/done 帧；心跳 15s；停滞看门狗） |
+| POST | `/sessions/:id/stream` | SSE 流式（connected/delta/reasoning/tool/**tool_result**/**question**/turn/end/done 帧；心跳 15s；停滞看门狗） |
+| POST | `/sessions/:id/answer` | 回答流中挂起的 `ask_user_question` → `200 {accepted:true}`（不占忙闩；`404 question not found` / `400` 坏批 / `409 reply queued`） |
 | DELETE | `/sessions/:id` | 处置会话 → `204`（幂等；内存处置语义，见下「跨重启恢复」） |
 
 错误契约：`409 {"error":"session busy"}`、`404 {"error":"not found"}`、
 `400 {"error":"invalid cwd"}` / `400 {"error":"invalid prompt"}`。
+
+### ask_user_question 交互（answer 端点 + question 帧）
+
+模型调 `ask_user_question` 工具时 turn 挂起等待人类回答（timed 工具）。SSE 流发
+**`question` 帧** `{callId, questions, seq}`——问题/选项已结构化外发（不必挖
+tool 帧的 arguments JSON）；消费方渲染选项，用户选择后调
+`POST /sessions/:id/answer` 回传：
+
+```json
+{ "callId": "ask-1", "answers": [ { "id": "q1", "selected": ["测试"] } ] }
+```
+
+`answers` 逐题一批：每题恰一项、`id` 与 question 帧的 `questions[].id` 一一
+对应。回答经 DSH `userQuestions.answer` **steer 成 user 消息注入 running
+turn**——不占忙闩（不判不清 busy），流随即续跑（user/message → 后续
+step → turn/end）。三态：`200`（接受）；`404 question not found`（无该
+callId 的可回答问题——已答/超时/不存在）；`400`（批结构不合法）；`409
+reply queued`（该问题已有排队回复）。
+
+用户不回答时：流停滞 `stallTimeoutMs`（默认 300s）后看门狗报
+`turn stalled` 收流；模型侧 timed ask 自带超时也会先收尾。
+
+### tool_result 帧（工具结果外发）
+
+SSE 的 `tool` 帧只发调用（`{name, arguments, callId, seq}`）；配套的
+**`tool_result` 帧** `{callId, text, seq}` 把工具结果 text 块拼接外发——
+消费方经 `callId` 配对还原「调用 → 读到什么」全过程（对齐 dsh web 渲染）。
 
 > **stream 真流式**：delta/reasoning 帧逐 token 转发——订阅 DSH 的
 > `agent/assistant-stream` cordis 事件（agent 作用域、process-local，即 web UI
@@ -154,12 +182,15 @@ node scripts/smoke-standalone.mjs    # 双开验证（需先配 standalonePort: 
   `?since=` 增量；wait；DELETE 204 后再 prompt（**双模式**：stub 无持久化 → 404；
   真实持久化会话 → 200 自动 resume，`status` completed/error）；cwd 逃逸 400；
   tasks 抛错后门闩已清；win32 cwd 模拟。
-- **smoke-stream**（stub 17 项 + 真实可达时追加 5 项 R1-R5，共 21 项）：
+- **smoke-stream**（stub 21 项 + 真实可达时追加 5 项 R1-R5，共 26 项）：
   connected/delta/reasoning/tool/turn/end(usage)/done 帧序列与收流；
   **token 流经 `agent/assistant-stream` 通道注入（贴真实 DSH），逐 chunk →
-  逐 delta 帧**；无 chunk 全文差量补推；停滞看门狗；忙时 409；客户端断开
-  门闩已清；心跳基建；400/404；turn 归属；会话级 error 即时收流；真实流
-  **R1 断言逐 token delta > 1 帧（真流式标准）**/409/400/404/断开复验。
+  逐 delta 帧**；tool 帧含 callId + **tool_result 帧外发工具结果**（callId
+  配对）；**question 帧（ask_user_question 结构化外发）+ answer 端点全链路
+  （Q1-Q4：question 渲染 → 回答 → 流续跑收尾 → 三态 404/400/409）**；
+  无 chunk 全文差量补推；停滞看门狗；忙时 409；客户端断开门闩已清；心跳基建；
+  400/404；turn 归属；会话级 error 即时收流；真实流 **R1 断言逐 token
+  delta > 1 帧（真流式标准）**/409/400/404/断开复验。
 - **e2e-smoke**（9 项）：health → 建会话 → 需工具长任务 prompt → events 轮询
   （含 tool/call）→ 增量游标 → wait → stream 另一轮 → DELETE 204 → 同 id prompt
   复验（stub → 404；真实持久化 → 200，error 不算通过）→

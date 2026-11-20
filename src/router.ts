@@ -17,6 +17,7 @@ import { initSseStream, startSseHeartbeat } from './sse.js'
 import type { Context } from '@deepseek-ai/cordis'
 import type { HttpServerConfig } from './config.js'
 import type {
+  AnswerBody,
   ChatResult,
   CreateSessionBody,
   EventsResult,
@@ -345,9 +346,56 @@ function handleStream(
         // DSH 核心 tool/call 载荷: { turn, step, callId, name, arguments }（arguments 为模型原始 JSON 串）
         const name = fieldOf(view.data, 'name')
         const args = fieldOf(view.data, 'arguments')
+        const callId = fieldOf(view.data, 'callId')
+        const nameStr = typeof name === 'string' ? name : ''
+        const callIdStr = typeof callId === 'string' ? callId : ''
+        // ask_user_question 专用帧：把 arguments JSON 里的 questions 解析出来，
+        // 消费方直接渲染选项（answer 端点回传 callId + 逐题 answers）。
+        if (nameStr === 'ask_user_question' && typeof args === 'string' && args !== '') {
+          try {
+            const parsed = JSON.parse(args) as { questions?: unknown }
+            if (Array.isArray(parsed.questions)) {
+              sse.send('question', { callId: callIdStr, questions: parsed.questions, seq: view.seq })
+            } else {
+              sse.send('tool', { name: nameStr, arguments: args, callId: callIdStr, seq: view.seq })
+            }
+          } catch {
+            sse.send('tool', { name: nameStr, arguments: args, callId: callIdStr, seq: view.seq })
+          }
+          return
+        }
         sse.send('tool', {
-          name: typeof name === 'string' ? name : '',
+          name: nameStr,
           arguments: typeof args === 'string' ? args : '',
+          callId: callIdStr,
+          seq: view.seq,
+        })
+        return
+      }
+
+      if (view.type === 'tool/result') {
+        // 工具结果外发（tool 帧只发调用）：message.content 的 text 块拼接为
+        // text，非文本块以计数附注——调用经 callId 与 tool 帧配对还原全过程。
+        const message = fieldOf(view.data, 'message')
+        const content = fieldOf(message, 'content')
+        let text = ''
+        let otherBlocks = 0
+        if (Array.isArray(content)) {
+          for (const block of content) {
+            if (typeof block === 'object' && block !== null
+              && (block as Record<string, unknown>).type === 'text'
+              && typeof (block as Record<string, unknown>).text === 'string') {
+              text += (block as Record<string, unknown>).text as string
+            } else {
+              otherBlocks += 1
+            }
+          }
+        }
+        const callId = fieldOf(fieldOf(view.data, 'message'), 'toolCallId')
+        sse.send('tool_result', {
+          callId: typeof callId === 'string' ? callId : '',
+          text,
+          ...(otherBlocks > 0 ? { otherBlocks } : {}),
           seq: view.seq,
         })
         return
@@ -671,6 +719,67 @@ export function match(req: IncomingMessage, res: ServerResponse, subPath: string
         ? body.stallTimeoutMs
         : config.stallTimeoutMs
       handleStream(res, sessionId, body.prompt, stallTimeoutMs, record, deps)
+      return
+    }
+
+    if (action === '/answer' && method === 'POST') {
+      // 回答流中挂起的 ask_user_question（timed 工具）。语义：answer 把回复
+      // steer 成 user 消息注入 running turn——不经 followup，不占忙闩（不判
+      // 也不清 busy）；流里的 question 帧消费方拿来渲染选项，回答经本端点
+      // 回传。DSH 侧服务 ctx.userQuestions（动态探测，缺服务 501）。
+      let body: AnswerBody
+      try {
+        body = (await readJsonBody(req)) as AnswerBody
+      } catch {
+        badRequest(res, 'invalid body')
+        return
+      }
+      const answersValid = typeof body.callId === 'string' && body.callId !== ''
+        && Array.isArray(body.answers) && body.answers.length > 0
+        && body.answers.every((item) => typeof item?.id === 'string' && item.id !== ''
+          && Array.isArray(item.selected) && item.selected.every((label) => typeof label === 'string'))
+      if (!answersValid) {
+        badRequest(res, 'invalid answer')
+        return
+      }
+      let record
+      try {
+        record = await store.getOrCreate(sessionId, {})
+      } catch (error: unknown) {
+        if (error instanceof NotFoundError) {
+          sendJson(res, 404, { error: 'not found' })
+          return
+        }
+        sendError(res, 500, String(error))
+        return
+      }
+      const userQuestions = ctx.get('userQuestions') as
+        | { answer(agent: unknown, callId: string, answer: { answers: unknown }): boolean } | undefined
+      if (userQuestions === undefined || typeof userQuestions.answer !== 'function') {
+        sendError(res, 501, 'userQuestions service unavailable')
+        return
+      }
+      try {
+        // answer 的 agent 形参取 handle.agent（assertLiveRoot 校验在册根 agent）
+        const accepted = userQuestions.answer(record.handle.agent, body.callId, { answers: body.answers })
+        if (accepted) {
+          sendJson(res, 200, { accepted: true })
+        } else {
+          // 无该 callId 的可回答（continued/open）问题——已答/超时/不存在均落此
+          sendJson(res, 404, { error: 'question not found' })
+        }
+      } catch (error: unknown) {
+        const code = (error as { code?: string })?.code
+        if (code === 'BAD_ANSWER') {
+          sendJson(res, 400, { error: 'invalid answer batch', detail: String((error as Error)?.message ?? error) })
+          return
+        }
+        if (code === 'REPLY_QUEUED') {
+          sendJson(res, 409, { error: 'reply queued' })
+          return
+        }
+        sendError(res, 500, String(error))
+      }
       return
     }
 
