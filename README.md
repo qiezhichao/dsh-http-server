@@ -21,6 +21,11 @@ DSH 插件（bundle）。在一个 DSH 宿主进程内提供会话全生命周�
 错误契约：`409 {"error":"session busy"}`、`404 {"error":"not found"}`、
 `400 {"error":"invalid cwd"}` / `400 {"error":"invalid prompt"}`。
 
+> **stream 真流式**：delta/reasoning 帧逐 token 转发——订阅 DSH 的
+> `agent/assistant-stream` cordis 事件（agent 作用域、process-local，即 web UI
+> 打字机效果的同一通道）。harness 未发 chunk 只给 assistant/message 全文时，
+> 自动降级为差量补推（内容不丢不重），消费方无感知。
+
 ## 构建
 
 ```sh

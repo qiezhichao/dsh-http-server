@@ -234,6 +234,12 @@ function stubHandle(sessionId, ctx, persistence) {
     if (handle.disposed) return
     ctx.emit('session/event', { id: sessionId }, { type, seq: seq++, time: Date.now(), data })
   }
+  // token 级增量走 agent/assistant-stream（对齐真实 DSH：chunk 帧是 agent 作用域
+  // cordis 事件，不发进 session/event 持久化总线——插件的双订阅各自消费）。
+  const emitStream = (type, chunk) => {
+    if (handle.disposed) return
+    ctx.emit('agent/assistant-stream', { agent: { session: { id: sessionId } }, frame: { type, attemptId: 'a1', revision: 1, index: 0, time: Date.now(), chunk } })
+  }
   const finishTurn = (turn, fullText, usage) => {
     emit('assistant/message', {
       turn, step: 1,
@@ -256,9 +262,7 @@ function stubHandle(sessionId, ctx, persistence) {
       emit('turn/start', { turn })
       emit('step/start', { turn, step: 1 })
       for (let k = 0; k < 4; k++) {
-        setTimeout(() => emit('assistant/chunk', {
-          turn, step: 1, chunk: { type: 'text-delta', index: 0, text: `第${turn}轮回复片段${k} ` },
-        }), 200 * (k + 1))
+        setTimeout(() => emitStream('chunk', { type: 'text-delta', text: `第${turn}轮回复片段${k} ` }), 200 * (k + 1))
       }
       setTimeout(() => finishTurn(turn, `第${turn}轮回复全文`,
         { inputTokens: 11, outputTokens: 22, cacheReadTokens: 2, cacheWriteTokens: 1, totalTokens: 33 }), 1200)
@@ -277,9 +281,9 @@ function stubHandle(sessionId, ctx, persistence) {
       }
       emit('step/start', { turn, step: 1 })
       if (handle.mode === 'full') {
-        emit('assistant/chunk', { turn, step: 1, chunk: { type: 'reasoning-delta', index: 0, text: '思考中' } })
+        emitStream('chunk', { type: 'reasoning-delta', text: '思考中' })
         for (const t of ['1\n', '2\n', '3\n']) {
-          emit('assistant/chunk', { turn, step: 1, chunk: { type: 'text-delta', index: 0, text: t } })
+          emitStream('chunk', { type: 'text-delta', text: t })
         }
         emit('tool/call', { turn, step: 1, callId: 'c1', name: 'list_files', arguments: '{"path":"."}' })
         emit('tool/result', { turn, step: 1, message: { role: 'tool', content: [] } })
@@ -518,15 +522,15 @@ async function assertStubSuite(base, stub) {
 // ---------------------------------------------------------------------------
 
 async function assertRealSuite(base) {
-  // R1 正常流：connected / ≥1 delta / turn/end / done 后收流
+  // R1 正常流：connected / 逐 token delta（真流式：>1 帧，非 turn 结束后单帧补推）/ turn/end / done 后收流
   {
     const sessionId = await createSession(base)
     const r = await streamOnce(base, sessionId, { prompt: '数到5，每个数字一行', stallTimeoutMs: 300000 })
     const deltas = framesOf(r.frames, 'delta')
     const turnEnd = framesOf(r.frames, 'turn/end')
     const done = framesOf(r.frames, 'done')
-    check('R1 真实流：connected + delta + turn/end + done 收流',
-      r.status === 200 && framesOf(r.frames, 'connected').length === 1 && deltas.length >= 1
+    check('R1 真实流：connected + 逐 token delta（>1）+ turn/end + done 收流',
+      r.status === 200 && framesOf(r.frames, 'connected').length === 1 && deltas.length > 1
         && turnEnd.length === 1 && done.length === 1 && r.closed,
       `status=${r.status} deltas=${deltas.length} turnEnd=${turnEnd.length} done=${done.length} closed=${r.closed}`)
   }
